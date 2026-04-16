@@ -54,6 +54,11 @@ def _preprocess_macros(soup: BeautifulSoup, base_url: str = "") -> None:
             else:
                 link.replace_with(soup.new_string(display or "[link]"))
             continue
+        # User mentions: <ac:link><ri:user ri:account-id="..."/></ac:link>
+        user_ref = link.find("ri:user")
+        if user_ref:
+            link.replace_with(soup.new_string("@user"))
+            continue
         # URL links
         url_ref = link.find("ri:url")
         if url_ref:
@@ -88,6 +93,49 @@ def _preprocess_macros(soup: BeautifulSoup, base_url: str = "") -> None:
     # Emoticons — strip
     for emoticon in soup.find_all("ac:emoticon"):
         emoticon.decompose()
+
+    # Date elements: <time datetime="2025-05-21" />
+    for time_el in soup.find_all("time"):
+        dt = time_el.get("datetime", "")
+        time_el.replace_with(soup.new_string(dt))
+
+    # Placeholders — template hint text, strip entirely
+    for ph in soup.find_all("ac:placeholder"):
+        ph.decompose()
+
+    # ADF extensions (decisions, etc.): <ac:adf-extension>
+    for adf_ext in soup.find_all("ac:adf-extension"):
+        # Check for decision lists
+        decision_list = adf_ext.find("ac:adf-node", attrs={"type": "decision-list"})
+        if decision_list:
+            decisions = decision_list.find_all(
+                "ac:adf-node", attrs={"type": "decision-item"}
+            )
+            items = []
+            for d in decisions:
+                state_attr = d.find("ac:adf-attribute", attrs={"key": "state"})
+                state = state_attr.get_text(strip=True) if state_attr else ""
+                # Extract any text content (decision body, if present)
+                texts = [
+                    n.get_text(strip=True)
+                    for n in d.find_all("ac:adf-content")
+                ]
+                body = " ".join(texts).strip()
+                if body:
+                    items.append(f"[{state}] {body}" if state else body)
+                elif state:
+                    items.append(f"[{state}]")
+            if items:
+                adf_ext.replace_with(soup.new_string(
+                    "[Decisions: " + "; ".join(items) + "]"
+                ))
+            else:
+                adf_ext.replace_with(soup.new_string("[Decisions]"))
+            continue
+        # Generic ADF extension fallback
+        adf_ext.replace_with(soup.new_string(
+            adf_ext.get_text(strip=True) or "[ADF extension]"
+        ))
 
     # Jira issue links: <ac:structured-macro ac:name="jira">
     for macro in soup.find_all(
