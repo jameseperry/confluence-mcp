@@ -61,7 +61,7 @@ async def _fetch_page_markdown(page_id: str) -> tuple[dict, str] | dict:
         return {"error": f"Failed to get page: {exc.response.status_code}", "page_id": page_id}
 
     storage_body = page.get("body", {}).get("storage", {}).get("value", "")
-    markdown = storage_to_markdown(storage_body)
+    markdown = storage_to_markdown(storage_body, base_url=get_base_url())
 
     _page_cache[page_id] = (page, markdown)
     if len(_page_cache) > _CACHE_MAX:
@@ -155,17 +155,28 @@ async def get_page(
     max_length = get_max_length()
     content, total_length, has_more = slice_content(full_markdown, max_length, start_offset)
 
+    client = get_client()
     try:
-        labels = await get_client().get_labels(page_id)
+        labels = await client.get_labels(page_id)
         label_names = [lb.get("name", "") for lb in labels]
     except httpx.HTTPStatusError:
         label_names = []
+
+    try:
+        ancestors = await client.get_ancestors(page_id)
+        breadcrumbs = [
+            {"id": str(a.get("id", "")), "title": a.get("title", "")}
+            for a in ancestors
+        ]
+    except httpx.HTTPStatusError:
+        breadcrumbs = []
 
     version = page.get("version", {})
     result: dict = {
         "id": str(page.get("id", "")),
         "title": page.get("title", ""),
         "space_id": page.get("spaceId", ""),
+        "breadcrumbs": breadcrumbs,
         "content": content,
         "total_length": total_length,
         "labels": label_names,
@@ -364,6 +375,51 @@ async def list_spaces(
         )
 
     return {"spaces": spaces}
+
+
+async def get_space_pages(
+    space_key: Annotated[
+        str,
+        Field(description="Space key (e.g. 'DEV'). Use list_spaces to find available keys."),
+    ],
+    limit: Annotated[
+        int,
+        Field(description="Maximum number of pages to return (default 25)"),
+    ] = 25,
+) -> dict:
+    """Get the top-level pages in a Confluence space. Use get_child_pages to navigate deeper."""
+    client = get_client()
+    limit = max(1, min(limit, 100))
+
+    try:
+        space = await client.get_space_by_key(space_key)
+    except httpx.HTTPStatusError as exc:
+        return {"error": f"Failed to look up space: {exc.response.status_code}", "space_key": space_key}
+
+    if space is None:
+        return {"error": f"Space '{space_key}' not found", "space_key": space_key}
+
+    space_id = str(space.get("id", ""))
+    try:
+        data = await client.get_space_pages(space_id, depth="root", limit=limit)
+    except httpx.HTTPStatusError as exc:
+        return {"error": f"Failed to get pages: {exc.response.status_code}", "space_key": space_key}
+
+    pages = []
+    for pg in data.get("results", []):
+        pages.append(
+            {
+                "id": str(pg.get("id", "")),
+                "title": pg.get("title", ""),
+                "status": pg.get("status", ""),
+            }
+        )
+
+    return {
+        "space_key": space_key,
+        "space_name": space.get("name", ""),
+        "pages": pages,
+    }
 
 
 async def get_child_pages(

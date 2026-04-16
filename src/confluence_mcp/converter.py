@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 
@@ -9,7 +10,7 @@ from bs4 import BeautifulSoup, Tag
 from markdownify import markdownify
 
 
-def _preprocess_macros(soup: BeautifulSoup) -> None:
+def _preprocess_macros(soup: BeautifulSoup, base_url: str = "") -> None:
     """Replace Confluence-specific XML elements with HTML that markdownify handles."""
 
     # Code blocks: <ac:structured-macro ac:name="code">
@@ -36,17 +37,22 @@ def _preprocess_macros(soup: BeautifulSoup) -> None:
             bq.append(BeautifulSoup(f"<p><strong>{label}:</strong></p>{inner}", "html.parser"))
             macro.replace_with(bq)
 
-    # Links: <ac:link><ri:page ri:content-title="..."/></ac:link>
+    # Links: <ac:link><ri:page ri:content-title="..." ri:content-id="..."/></ac:link>
     for link in soup.find_all("ac:link"):
         page_ref = link.find("ri:page")
         if page_ref:
             title = page_ref.get("ri:content-title", "")
+            page_id = page_ref.get("ri:content-id", "")
             link_body = link.find("ac:plain-text-link-body") or link.find(
                 "ac:link-body"
             )
             display = link_body.get_text(strip=True) if link_body else title
-            replacement = soup.new_string(display or "[link]")
-            link.replace_with(replacement)
+            if page_id and base_url:
+                a_tag = soup.new_tag("a", href=f"{base_url}/wiki/pages/{page_id}")
+                a_tag.string = display or f"page:{page_id}"
+                link.replace_with(a_tag)
+            else:
+                link.replace_with(soup.new_string(display or "[link]"))
             continue
         # URL links
         url_ref = link.find("ri:url")
@@ -81,6 +87,41 @@ def _preprocess_macros(soup: BeautifulSoup) -> None:
     for emoticon in soup.find_all("ac:emoticon"):
         emoticon.decompose()
 
+    # Jira issue links: <ac:structured-macro ac:name="jira">
+    for macro in soup.find_all(
+        "ac:structured-macro", attrs={"ac:name": "jira"}
+    ):
+        key_param = macro.find("ac:parameter", attrs={"ac:name": "key"})
+        if key_param:
+            key = key_param.get_text(strip=True)
+            macro.replace_with(soup.new_string(key))
+        else:
+            macro.replace_with(soup.new_string("[JIRA]"))
+
+    # ADF smart links (fab:adf) — newer Jira/Confluence inline cards
+    for adf in soup.find_all("fab:adf"):
+        try:
+            adf_json = json.loads(adf.get_text())
+            texts = []
+            for node in adf_json.get("content", []):
+                for inline in node.get("content", []):
+                    if inline.get("type") == "inlineCard":
+                        url = inline.get("attrs", {}).get("url", "")
+                        # Extract Jira issue key from URL if possible
+                        jira_match = re.search(r"/browse/([A-Z]+-\d+)", url)
+                        if jira_match:
+                            texts.append(jira_match.group(1))
+                        elif url:
+                            texts.append(url)
+                    elif inline.get("type") == "text":
+                        texts.append(inline.get("text", ""))
+            if texts:
+                adf.replace_with(soup.new_string(" ".join(texts)))
+            else:
+                adf.replace_with(soup.new_string(adf.get_text(strip=True) or ""))
+        except (json.JSONDecodeError, AttributeError):
+            adf.replace_with(soup.new_string(adf.get_text(strip=True) or ""))
+
     # Status lozenges: <ac:structured-macro ac:name="status">
     for macro in soup.find_all(
         "ac:structured-macro", attrs={"ac:name": "status"}
@@ -97,13 +138,13 @@ def _preprocess_macros(soup: BeautifulSoup) -> None:
         macro.unwrap()
 
 
-def storage_to_markdown(storage_html: str) -> str:
+def storage_to_markdown(storage_html: str, base_url: str = "") -> str:
     """Convert Confluence storage format XHTML to readable Markdown."""
     if not storage_html or not storage_html.strip():
         return ""
 
     soup = BeautifulSoup(storage_html, "html.parser")
-    _preprocess_macros(soup)
+    _preprocess_macros(soup, base_url)
 
     md = markdownify(
         str(soup),

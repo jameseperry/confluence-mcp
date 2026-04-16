@@ -30,7 +30,8 @@ def create_mcp_server() -> FastMCP:
             "get_page_outline to see a page's heading structure, "
             "get_page_section to read a specific section, "
             "get_page_by_title to find a page by name in a space, "
-            "and list_spaces to discover available spaces."
+            "list_spaces to discover available spaces, "
+            "and get_space_pages to browse a space's page tree."
         ),
         lifespan=lifespan,
     )
@@ -41,6 +42,7 @@ def create_mcp_server() -> FastMCP:
     mcp.add_tool(tools.get_page_section)
     mcp.add_tool(tools.get_page_by_title)
     mcp.add_tool(tools.list_spaces)
+    mcp.add_tool(tools.get_space_pages)
     mcp.add_tool(tools.get_child_pages)
 
     return mcp

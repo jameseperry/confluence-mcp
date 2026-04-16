@@ -61,6 +61,23 @@ class ConfluenceClient:
             params["cursor"] = cursor
         return await self._get("/wiki/rest/api/content/search", params=params)
 
+    async def get_ancestors(self, page_id: str) -> list[dict]:
+        data = await self._get(f"/wiki/api/v2/pages/{page_id}/ancestors")
+        return data.get("results", [])
+
+    async def get_space_by_key(self, space_key: str) -> dict | None:
+        data = await self._get("/wiki/api/v2/spaces", params={"keys": space_key})
+        results = data.get("results", [])
+        return results[0] if results else None
+
+    async def get_space_pages(
+        self, space_id: str, depth: str = "root", limit: int = 25
+    ) -> dict:
+        return await self._get(
+            f"/wiki/api/v2/spaces/{space_id}/pages",
+            params={"depth": depth, "limit": limit},
+        )
+
     async def get_labels(self, page_id: str) -> list[dict]:
         data = await self._get(f"/wiki/api/v2/pages/{page_id}/labels")
         return data.get("results", [])
