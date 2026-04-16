@@ -96,9 +96,37 @@ def _preprocess_macros(soup: BeautifulSoup, base_url: str = "") -> None:
         key_param = macro.find("ac:parameter", attrs={"ac:name": "key"})
         if key_param:
             key = key_param.get_text(strip=True)
-            macro.replace_with(soup.new_string(key))
+            server_param = macro.find("ac:parameter", attrs={"ac:name": "server"})
+            server = server_param.get_text(strip=True) if server_param else ""
+            server = re.sub(r"^Jira Cloud\s+", "", server)
+            if server:
+                macro.replace_with(soup.new_string(f"{key} (Jira: {server})"))
+            else:
+                macro.replace_with(soup.new_string(key))
         else:
             macro.replace_with(soup.new_string("[JIRA]"))
+
+    # Jira datasource tables: <a data-datasource="..."> with embedded JQL
+    for link in soup.find_all("a", attrs={"data-datasource": True}):
+        try:
+            ds = json.loads(link["data-datasource"])
+            jql = ds.get("parameters", {}).get("jql", "")
+            if jql:
+                # Extract instance name from href (e.g. "amd-hub" from "https://amd-hub.atlassian.net/...")
+                href = link.get("href", "")
+                instance_match = re.search(r"https?://([^.]+)\.atlassian\.net", href)
+                instance = instance_match.group(1) if instance_match else ""
+                if instance:
+                    link.replace_with(soup.new_string(
+                        f"[Jira table ({instance}): {jql}]"
+                    ))
+                else:
+                    link.replace_with(soup.new_string(
+                        f"[Jira table: {jql}]"
+                    ))
+                continue
+        except (json.JSONDecodeError, KeyError):
+            pass
 
     # ADF smart links (fab:adf) — newer Jira/Confluence inline cards
     for adf in soup.find_all("fab:adf"):

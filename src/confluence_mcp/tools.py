@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from collections import OrderedDict
 from typing import Annotated
 
@@ -28,7 +29,8 @@ _CQL_INDICATORS = re.compile(
 )
 
 _CACHE_MAX = 20
-_page_cache: OrderedDict[str, tuple[dict, str]] = OrderedDict()
+_CACHE_TTL = 300  # 5 minutes
+_page_cache: OrderedDict[str, tuple[dict, str, float]] = OrderedDict()
 
 
 def _is_cql(query: str) -> bool:
@@ -42,13 +44,16 @@ def _escape_cql(text: str) -> str:
 
 
 async def _fetch_page_markdown(page_id: str) -> tuple[dict, str] | dict:
-    """Fetch a page and convert to markdown, with LRU caching.
+    """Fetch a page and convert to markdown, with LRU caching (5 min TTL).
 
     Returns (page_dict, markdown) or an error dict.
     """
     if page_id in _page_cache:
-        _page_cache.move_to_end(page_id)
-        return _page_cache[page_id]
+        page, markdown, cached_at = _page_cache[page_id]
+        if time.monotonic() - cached_at < _CACHE_TTL:
+            _page_cache.move_to_end(page_id)
+            return page, markdown
+        del _page_cache[page_id]
 
     client = get_client()
     try:
@@ -63,7 +68,7 @@ async def _fetch_page_markdown(page_id: str) -> tuple[dict, str] | dict:
     storage_body = page.get("body", {}).get("storage", {}).get("value", "")
     markdown = storage_to_markdown(storage_body, base_url=get_base_url())
 
-    _page_cache[page_id] = (page, markdown)
+    _page_cache[page_id] = (page, markdown, time.monotonic())
     if len(_page_cache) > _CACHE_MAX:
         _page_cache.popitem(last=False)
 
@@ -202,6 +207,57 @@ async def get_page(
         result["next_offset"] = next_offset
         result["continuation_hint"] = (
             f"Content truncated. Call get_page(\"{page_id}\", start_offset={next_offset}) "
+            f"to read more ({total_length - next_offset} characters remaining)."
+        )
+
+    return result
+
+
+async def get_page_raw(
+    page_id: Annotated[
+        str,
+        Field(description="The Confluence page ID (numeric string)"),
+    ],
+    start_offset: Annotated[
+        int,
+        Field(
+            description=(
+                "Character offset to start reading from. "
+                "Use this to continue reading a page that was truncated. Default 0."
+            )
+        ),
+    ] = 0,
+) -> dict:
+    """Get a Confluence page by ID, returning the raw Confluence storage format (XHTML) without conversion."""
+    client = get_client()
+    try:
+        page = await client.get_page(page_id, body_format="storage")
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return {"error": "Page not found", "page_id": page_id}
+        if exc.response.status_code == 401:
+            return {"error": "Authentication failed — check API token and username"}
+        return {"error": f"Failed to get page: {exc.response.status_code}", "page_id": page_id}
+
+    storage_body = page.get("body", {}).get("storage", {}).get("value", "")
+
+    max_length = get_max_length()
+    content, total_length, has_more = slice_content(storage_body, max_length, start_offset)
+
+    result: dict = {
+        "id": str(page.get("id", "")),
+        "title": page.get("title", ""),
+        "format": "storage",
+        "content": content,
+        "total_length": total_length,
+    }
+
+    if has_more:
+        next_offset = start_offset + len(content)
+        result["truncated"] = True
+        result["next_offset"] = next_offset
+        result["continuation_hint"] = (
+            f"Content truncated. Call get_page_raw(\"{page_id}\", start_offset={next_offset}) "
             f"to read more ({total_length - next_offset} characters remaining)."
         )
 

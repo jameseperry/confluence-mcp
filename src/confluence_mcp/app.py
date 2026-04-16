@@ -38,6 +38,7 @@ def create_mcp_server() -> FastMCP:
 
     mcp.add_tool(tools.search)
     mcp.add_tool(tools.get_page)
+    mcp.add_tool(tools.get_page_raw)
     mcp.add_tool(tools.get_page_outline)
     mcp.add_tool(tools.get_page_section)
     mcp.add_tool(tools.get_page_by_title)
