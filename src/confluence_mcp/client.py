@@ -56,14 +56,22 @@ class ConfluenceClient:
     async def search_cql(
         self, cql: str, limit: int = 10, cursor: str | None = None
     ) -> dict:
-        params: dict = {"cql": cql, "limit": limit, "expand": "space,version"}
+        params: dict = {
+            "cql": cql,
+            "limit": limit,
+            "excerpt": "highlight",
+            "expand": "content.space,content.version",
+        }
         if cursor:
             params["cursor"] = cursor
-        return await self._get("/wiki/rest/api/content/search", params=params)
+        return await self._get("/wiki/rest/api/search", params=params)
 
     async def get_ancestors(self, page_id: str) -> list[dict]:
-        data = await self._get(f"/wiki/api/v2/pages/{page_id}/ancestors")
-        return data.get("results", [])
+        data = await self._get(
+            f"/wiki/rest/api/content/{page_id}",
+            params={"expand": "ancestors"},
+        )
+        return data.get("ancestors", [])
 
     async def get_space_by_key(self, space_key: str) -> dict | None:
         data = await self._get("/wiki/api/v2/spaces", params={"keys": space_key})
@@ -74,8 +82,8 @@ class ConfluenceClient:
         self, space_id: str, depth: str = "root", limit: int = 25
     ) -> dict:
         return await self._get(
-            f"/wiki/api/v2/spaces/{space_id}/pages",
-            params={"depth": depth, "limit": limit},
+            "/wiki/api/v2/pages",
+            params={"space-id": space_id, "depth": depth, "limit": limit},
         )
 
     async def get_labels(self, page_id: str) -> list[dict]:

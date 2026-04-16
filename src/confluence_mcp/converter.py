@@ -74,6 +74,8 @@ def _preprocess_macros(soup: BeautifulSoup, base_url: str = "") -> None:
         attachment = img.find("ri:attachment")
         if attachment:
             filename = attachment.get("ri:filename", "image")
+            # Strip query params from filename
+            filename = filename.split("?")[0]
             img_tag = soup.new_tag("img", alt=filename, src=filename)
             img.replace_with(img_tag)
         else:
@@ -122,6 +124,24 @@ def _preprocess_macros(soup: BeautifulSoup, base_url: str = "") -> None:
         except (json.JSONDecodeError, AttributeError):
             adf.replace_with(soup.new_string(adf.get_text(strip=True) or ""))
 
+    # Task lists: <ac:task-list><ac:task><ac:task-id>...</ac:task-id>
+    #   <ac:task-status>complete|incomplete</ac:task-status>
+    #   <ac:task-body>...</ac:task-body></ac:task></ac:task-list>
+    for task in soup.find_all("ac:task"):
+        status_el = task.find("ac:task-status")
+        body_el = task.find("ac:task-body")
+        status = status_el.get_text(strip=True) if status_el else "incomplete"
+        body_html = body_el.decode_contents() if body_el else ""
+        checkbox = "[x]" if status == "complete" else "[ ]"
+        li = soup.new_tag("li")
+        li.append(BeautifulSoup(f"{checkbox} {body_html}", "html.parser"))
+        task.replace_with(li)
+    for task_list in soup.find_all("ac:task-list"):
+        ul = soup.new_tag("ul")
+        for child in list(task_list.children):
+            ul.append(child.extract())
+        task_list.replace_with(ul)
+
     # Status lozenges: <ac:structured-macro ac:name="status">
     for macro in soup.find_all(
         "ac:structured-macro", attrs={"ac:name": "status"}
@@ -130,12 +150,29 @@ def _preprocess_macros(soup: BeautifulSoup, base_url: str = "") -> None:
         text = title_param.get_text(strip=True) if title_param else "STATUS"
         macro.replace_with(soup.new_string(f"[{text}]"))
 
-    # Catch-all: any remaining ac:structured-macro → extract inner text
+    # Catch-all: any remaining ac:structured-macro
     for macro in soup.find_all("ac:structured-macro"):
+        macro_name = macro.get("ac:name", "unknown")
         body = macro.find("ac:rich-text-body")
         if body:
+            # Macro wraps real content (e.g. expand, section) — keep the content
+            for param in macro.find_all("ac:parameter"):
+                param.decompose()
             body.unwrap()
-        macro.unwrap()
+            macro.unwrap()
+        else:
+            # Dynamic/server-side macro (e.g. contentbylabel, plantuml, drawio)
+            # — no renderable content, emit a placeholder
+            macro.replace_with(soup.new_string(f"[Confluence macro: {macro_name}]"))
+
+
+def _clean_images(soup: BeautifulSoup) -> None:
+    """Strip query params from <img> src and alt attributes."""
+    for img in soup.find_all("img"):
+        for attr in ("src", "alt"):
+            val = img.get(attr, "")
+            if "?" in val:
+                img[attr] = val.split("?")[0]
 
 
 def storage_to_markdown(storage_html: str, base_url: str = "") -> str:
@@ -145,6 +182,7 @@ def storage_to_markdown(storage_html: str, base_url: str = "") -> str:
 
     soup = BeautifulSoup(storage_html, "html.parser")
     _preprocess_macros(soup, base_url)
+    _clean_images(soup)
 
     md = markdownify(
         str(soup),

@@ -117,6 +117,17 @@ async def search(
         content = item.get("content", item)
         space = content.get("space", {})
         version = content.get("version", {})
+
+        # Excerpt can be at item level or nested; may contain HTML highlight markers
+        excerpt = (
+            item.get("excerpt")
+            or item.get("resultExcerpt")
+            or content.get("excerpt")
+            or ""
+        )
+        if excerpt:
+            excerpt = re.sub(r"<[^>]+>", "", excerpt).strip()
+
         results.append(
             {
                 "id": str(content.get("id", "")),
@@ -124,7 +135,7 @@ async def search(
                 "space_key": space.get("key", ""),
                 "space_name": space.get("name", ""),
                 "last_modified": version.get("when", ""),
-                "excerpt": item.get("excerpt", ""),
+                "excerpt": excerpt,
             }
         )
 
