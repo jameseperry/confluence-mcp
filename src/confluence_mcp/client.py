@@ -29,6 +29,20 @@ class ConfluenceClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def _post(self, path: str, json_body: dict | list) -> dict:
+        resp = await self._http.post(path, json=json_body)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def _put(self, path: str, json_body: dict) -> dict:
+        resp = await self._http.put(path, json=json_body)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def _delete(self, path: str) -> None:
+        resp = await self._http.delete(path)
+        resp.raise_for_status()
+
     async def get_page(
         self, page_id: str, body_format: str = "storage"
     ) -> dict:
@@ -89,6 +103,71 @@ class ConfluenceClient:
     async def get_labels(self, page_id: str) -> list[dict]:
         data = await self._get(f"/wiki/api/v2/pages/{page_id}/labels")
         return data.get("results", [])
+
+    async def create_page(
+        self,
+        space_id: str,
+        title: str,
+        body: str,
+        parent_id: str | None = None,
+    ) -> dict:
+        payload: dict = {
+            "spaceId": space_id,
+            "status": "current",
+            "title": title,
+            "body": {"representation": "storage", "value": body},
+        }
+        if parent_id:
+            payload["parentId"] = parent_id
+        return await self._post("/wiki/api/v2/pages", payload)
+
+    async def update_page(
+        self,
+        page_id: str,
+        title: str,
+        body: str,
+        version_number: int,
+        version_message: str | None = None,
+    ) -> dict:
+        version: dict = {"number": version_number}
+        if version_message:
+            version["message"] = version_message
+        payload = {
+            "id": page_id,
+            "status": "current",
+            "title": title,
+            "body": {"representation": "storage", "value": body},
+            "version": version,
+        }
+        return await self._put(f"/wiki/api/v2/pages/{page_id}", payload)
+
+    async def get_comments(
+        self, page_id: str, limit: int = 25
+    ) -> dict:
+        return await self._get(
+            f"/wiki/api/v2/pages/{page_id}/footer-comments",
+            params={"body-format": "storage", "limit": limit},
+        )
+
+    async def create_comment(
+        self, page_id: str, body: str
+    ) -> dict:
+        return await self._post(
+            "/wiki/api/v2/footer-comments",
+            {
+                "pageId": page_id,
+                "body": {"representation": "storage", "value": body},
+            },
+        )
+
+    async def add_label(self, page_id: str, label: str) -> dict:
+        return await self._post(
+            f"/wiki/rest/api/content/{page_id}/label",
+            [{"prefix": "global", "name": label}],
+        )
+
+    async def delete_page(self, page_id: str) -> None:
+        await self._delete(f"/wiki/api/v2/pages/{page_id}")
 
     async def close(self) -> None:
         await self._http.aclose()

@@ -25,25 +25,36 @@ def create_mcp_server() -> FastMCP:
     mcp = FastMCP(
         name="confluence",
         instructions=(
-            "Confluence MCP provides read access to Confluence Cloud pages and spaces. "
-            "Use search to find pages by text or CQL query, get_page to read full page content, "
-            "get_page_outline to see a page's heading structure, "
-            "get_page_section to read a specific section, "
-            "get_page_by_title to find a page by name in a space, "
-            "list_spaces to discover available spaces, "
-            "and get_space_pages to browse a space's page tree."
+            "Confluence MCP provides read and write access to Confluence Cloud pages and spaces. "
+            "Reading: use get_page (format='md' or 'xhtml'), get_page_section, get_page_outline, "
+            "get_page_by_title, search, list_spaces, get_space_pages, get_child_pages. "
+            "Writing: use create_page (XHTML), update_page (full page XHTML), "
+            "update_page_section (replace one section), append_to_page, append_to_section. "
+            "For editing, read with format='xhtml', modify the XHTML, then write back."
         ),
         lifespan=lifespan,
     )
 
+    # Read
     mcp.add_tool(tools.search)
     mcp.add_tool(tools.get_page)
-    mcp.add_tool(tools.get_page_raw)
     mcp.add_tool(tools.get_page_outline)
     mcp.add_tool(tools.get_page_section)
     mcp.add_tool(tools.get_page_by_title)
+    # Browse
     mcp.add_tool(tools.list_spaces)
     mcp.add_tool(tools.get_space_pages)
     mcp.add_tool(tools.get_child_pages)
+    # Write
+    mcp.add_tool(tools.create_page)
+    mcp.add_tool(tools.update_page)
+    mcp.add_tool(tools.update_page_section)
+    mcp.add_tool(tools.append_to_page)
+    mcp.add_tool(tools.append_to_section)
+    # Comments, labels, delete
+    mcp.add_tool(tools.get_comments)
+    mcp.add_tool(tools.add_comment)
+    mcp.add_tool(tools.add_label)
+    mcp.add_tool(tools.delete_page)
 
     return mcp
