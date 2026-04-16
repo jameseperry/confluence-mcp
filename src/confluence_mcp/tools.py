@@ -411,10 +411,39 @@ async def get_space_pages(
         return {"error": f"Space '{space_key}' not found", "space_key": space_key}
 
     space_id = str(space.get("id", ""))
+    fallback = False
     try:
         data = await client.get_space_pages(space_id, depth="root", limit=limit)
     except httpx.HTTPStatusError as exc:
-        return {"error": f"Failed to get pages: {exc.response.status_code}", "space_key": space_key}
+        if exc.response.status_code >= 500:
+            # Large spaces can cause the v2 API to 500; fall back to CQL search
+            fallback = True
+        else:
+            return {"error": f"Failed to get pages: {exc.response.status_code}", "space_key": space_key}
+
+    if fallback:
+        cql = f'space.key = "{_escape_cql(space_key)}" AND type = "page" ORDER BY title ASC'
+        try:
+            data = await client.search_cql(cql, limit=limit)
+        except httpx.HTTPStatusError as exc:
+            return {"error": f"Failed to get pages: {exc.response.status_code}", "space_key": space_key}
+        pages = []
+        for item in data.get("results", []):
+            content = item.get("content", item)
+            pages.append(
+                {
+                    "id": str(content.get("id", "")),
+                    "title": content.get("title", ""),
+                    "status": content.get("status", "current"),
+                }
+            )
+        result: dict = {
+            "space_key": space_key,
+            "space_name": space.get("name", ""),
+            "pages": pages,
+            "note": "Space too large for tree listing; showing pages by title. Use search to find specific pages.",
+        }
+        return result
 
     pages = []
     for pg in data.get("results", []):
