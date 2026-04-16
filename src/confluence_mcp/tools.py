@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from typing import Annotated
 
 import httpx
@@ -26,6 +27,9 @@ _CQL_INDICATORS = re.compile(
     re.VERBOSE | re.IGNORECASE,
 )
 
+_CACHE_MAX = 20
+_page_cache: OrderedDict[str, tuple[dict, str]] = OrderedDict()
+
 
 def _is_cql(query: str) -> bool:
     """Heuristic: does the query look like raw CQL?"""
@@ -38,7 +42,14 @@ def _escape_cql(text: str) -> str:
 
 
 async def _fetch_page_markdown(page_id: str) -> tuple[dict, str] | dict:
-    """Fetch a page and convert to markdown. Returns (page_dict, markdown) or an error dict."""
+    """Fetch a page and convert to markdown, with LRU caching.
+
+    Returns (page_dict, markdown) or an error dict.
+    """
+    if page_id in _page_cache:
+        _page_cache.move_to_end(page_id)
+        return _page_cache[page_id]
+
     client = get_client()
     try:
         page = await client.get_page(page_id, body_format="storage")
@@ -50,7 +61,13 @@ async def _fetch_page_markdown(page_id: str) -> tuple[dict, str] | dict:
         return {"error": f"Failed to get page: {exc.response.status_code}", "page_id": page_id}
 
     storage_body = page.get("body", {}).get("storage", {}).get("value", "")
-    return page, storage_to_markdown(storage_body)
+    markdown = storage_to_markdown(storage_body)
+
+    _page_cache[page_id] = (page, markdown)
+    if len(_page_cache) > _CACHE_MAX:
+        _page_cache.popitem(last=False)
+
+    return page, markdown
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +103,7 @@ async def search(
     if _is_cql(query):
         cql = query
     else:
-        cql = f'text ~ "{_escape_cql(query)}"'
+        cql = f'type = "page" AND text ~ "{_escape_cql(query)}"'
         if space_key:
             cql = f'space.key = "{_escape_cql(space_key)}" AND {cql}'
 
@@ -216,6 +233,15 @@ async def get_page_section(
             )
         ),
     ] = True,
+    start_offset: Annotated[
+        int,
+        Field(
+            description=(
+                "Character offset within the section to start reading from. "
+                "Use this to continue reading a section that was truncated. Default 0."
+            )
+        ),
+    ] = 0,
 ) -> dict:
     """Get the content of a specific section from a Confluence page."""
     fetched = await _fetch_page_markdown(page_id)
@@ -233,7 +259,7 @@ async def get_page_section(
         }
 
     max_length = get_max_length()
-    content, total_length, has_more = slice_content(section_text, max_length)
+    content, total_length, has_more = slice_content(section_text, max_length, start_offset)
 
     result: dict = {
         "id": str(page.get("id", "")),
@@ -244,10 +270,13 @@ async def get_page_section(
     }
 
     if has_more:
+        next_offset = start_offset + len(content)
         result["truncated"] = True
+        result["next_offset"] = next_offset
         result["continuation_hint"] = (
-            "Section content was truncated. Use get_page with start_offset to read the full page, "
-            "or set CONFLUENCE_MAX_LENGTH higher."
+            f"Section truncated. Call get_page_section(\"{page_id}\", \"{heading}\", "
+            f"start_offset={next_offset}) to read more "
+            f"({total_length - next_offset} characters remaining)."
         )
 
     return result
@@ -263,11 +292,11 @@ async def get_page_by_title(
         Field(description="Space key to search within (e.g. 'DEV')"),
     ],
 ) -> dict:
-    """Find a Confluence page by title within a space."""
+    """Find a Confluence page by title within a space. Returns page metadata (use get_page to read content)."""
     client = get_client()
 
     # Exact match first
-    cql = f'space.key = "{_escape_cql(space_key)}" AND title = "{_escape_cql(title)}"'
+    cql = f'type = "page" AND space.key = "{_escape_cql(space_key)}" AND title = "{_escape_cql(title)}"'
     try:
         data = await client.search_cql(cql, limit=5)
     except httpx.HTTPStatusError as exc:
@@ -277,7 +306,7 @@ async def get_page_by_title(
 
     # Fuzzy fallback
     if not results:
-        cql = f'space.key = "{_escape_cql(space_key)}" AND title ~ "{_escape_cql(title)}"'
+        cql = f'type = "page" AND space.key = "{_escape_cql(space_key)}" AND title ~ "{_escape_cql(title)}"'
         try:
             data = await client.search_cql(cql, limit=5)
         except httpx.HTTPStatusError as exc:
@@ -287,10 +316,22 @@ async def get_page_by_title(
     if not results:
         return {"error": "No page found", "title": title, "space_key": space_key}
 
-    # Return full content of the top match
-    content = results[0].get("content", results[0])
-    page_id = str(content.get("id", ""))
-    return await get_page(page_id)
+    matches = []
+    for item in results:
+        content = item.get("content", item)
+        space = content.get("space", {})
+        version = content.get("version", {})
+        matches.append(
+            {
+                "id": str(content.get("id", "")),
+                "title": content.get("title", ""),
+                "space_key": space.get("key", ""),
+                "space_name": space.get("name", ""),
+                "last_modified": version.get("when", ""),
+            }
+        )
+
+    return {"results": matches}
 
 
 async def list_spaces(

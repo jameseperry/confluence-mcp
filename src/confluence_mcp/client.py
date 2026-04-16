@@ -56,7 +56,7 @@ class ConfluenceClient:
     async def search_cql(
         self, cql: str, limit: int = 10, cursor: str | None = None
     ) -> dict:
-        params: dict = {"cql": cql, "limit": limit}
+        params: dict = {"cql": cql, "limit": limit, "expand": "space,version"}
         if cursor:
             params["cursor"] = cursor
         return await self._get("/wiki/rest/api/content/search", params=params)
