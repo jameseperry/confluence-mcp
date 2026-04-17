@@ -9,15 +9,22 @@ from fastmcp import FastMCP
 
 from . import tools
 from .client import init_client
-from .config import get_api_token, get_base_url, get_email
+from .config import get_api_token, get_base_url, get_email, get_indexer_url
+from .indexer_client import get_indexer_client, init_indexer_client
 
 
 @asynccontextmanager
 async def lifespan(server: FastMCP) -> AsyncIterator[None]:
     client = init_client(get_base_url(), get_email(), get_api_token())
+    indexer_url = get_indexer_url()
+    if indexer_url:
+        init_indexer_client(indexer_url, get_base_url(), get_email(), get_api_token())
     try:
         yield
     finally:
+        ic = get_indexer_client()
+        if ic:
+            await ic.close()
         await client.close()
 
 
@@ -56,5 +63,7 @@ def create_mcp_server() -> FastMCP:
     mcp.add_tool(tools.add_comment)
     mcp.add_tool(tools.add_label)
     mcp.add_tool(tools.delete_page)
+    # Semantic search (optional, requires indexer service)
+    mcp.add_tool(tools.semantic_search)
 
     return mcp

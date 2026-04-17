@@ -37,3 +37,8 @@ def get_max_length() -> int:
         return int(raw)
     except ValueError:
         return 50000
+
+
+def get_indexer_url() -> str | None:
+    url = os.environ.get("CONFLUENCE_INDEXER_URL", "").strip()
+    return url.rstrip("/") if url else None

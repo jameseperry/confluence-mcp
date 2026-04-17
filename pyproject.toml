@@ -13,8 +13,19 @@ dependencies = [
     "markdownify>=0.14.1",
 ]
 
+[project.optional-dependencies]
+indexer = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
+    "sentence-transformers>=3.0.0",
+    "sqlite-vec>=0.1.1",
+    "numpy",
+    "einops",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [project.scripts]
 confluence-mcp = "confluence_mcp.server:main"
+confluence-indexer = "confluence_indexer.cli:main"

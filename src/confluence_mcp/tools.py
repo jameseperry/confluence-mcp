@@ -14,6 +14,7 @@ from pydantic import Field
 from .client import get_client
 from .config import get_base_url, get_max_length
 from .converter import extract_outline, extract_section, slice_content, storage_to_markdown
+from .indexer_client import get_indexer_client
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1060,3 +1061,70 @@ async def delete_page(
 
     _page_cache.pop(page_id, None)
     return {"deleted": True, "page_id": page_id}
+
+
+# ---------------------------------------------------------------------------
+# Semantic search (via indexer service)
+# ---------------------------------------------------------------------------
+
+
+async def semantic_search(
+    query: Annotated[
+        str,
+        Field(description="Natural language search query"),
+    ],
+    scope: Annotated[
+        str,
+        Field(description="Restrict search to a specific index scope. Omit to search all."),
+    ] = "",
+    perspective: Annotated[
+        str,
+        Field(
+            description=(
+                "Search perspective (e.g. 'general', 'technical', 'procedural'). "
+                "Omit for best results across all perspectives."
+            )
+        ),
+    ] = "",
+    limit: Annotated[
+        int,
+        Field(description="Maximum results to return (default 10, max 50)"),
+    ] = 10,
+) -> dict:
+    """Semantic search across indexed Confluence pages using vector embeddings.
+
+    Returns ranked results with relevance scores, page titles, headings, and content snippets.
+    Requires a running indexer service (set CONFLUENCE_INDEXER_URL).
+    """
+    client = get_indexer_client()
+    if client is None:
+        return {
+            "error": "Semantic search not available — CONFLUENCE_INDEXER_URL not configured",
+        }
+
+    limit = max(1, min(limit, 50))
+    try:
+        data = await client.search(
+            query,
+            scope=scope or None,
+            perspective=perspective or None,
+            limit=limit,
+        )
+    except Exception as exc:
+        return {"error": f"Semantic search failed: {exc}"}
+
+    results = []
+    base_url = get_base_url()
+    for item in data.get("results", []):
+        results.append({
+            "score": round(item.get("score", 0), 4),
+            "page_id": item.get("page_id", ""),
+            "title": item.get("page_title", ""),
+            "space_key": item.get("space_key", ""),
+            "heading": item.get("heading", ""),
+            "snippet": item.get("snippet", ""),
+            "scope": item.get("scope", ""),
+            "url": f"{base_url}/wiki/pages/{item.get('page_id', '')}",
+        })
+
+    return {"query": query, "results": results}
