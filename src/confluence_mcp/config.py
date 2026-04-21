@@ -39,6 +39,15 @@ def get_max_length() -> int:
         return 50000
 
 
+def get_large_page_threshold() -> int:
+    """Content size (bytes) above which get_page returns an outline instead of full content."""
+    raw = os.environ.get("CONFLUENCE_LARGE_PAGE_THRESHOLD", "10000").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 10000
+
+
 def get_indexer_url() -> str | None:
     url = os.environ.get("CONFLUENCE_INDEXER_URL", "").strip()
     return url.rstrip("/") if url else None

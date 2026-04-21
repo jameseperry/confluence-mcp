@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup, Tag
 from pydantic import Field
 
 from .client import get_client
-from .config import get_base_url, get_max_length
+from .config import get_base_url, get_large_page_threshold, get_max_length
 from .converter import extract_outline, extract_section, slice_content, storage_to_markdown
 from .indexer_client import get_indexer_client
 
@@ -47,12 +47,12 @@ def _escape_cql(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
-async def _fetch_page_markdown(page_id: str) -> tuple[dict, str] | dict:
+async def _fetch_page_markdown(page_id: str, no_cache: bool = False) -> tuple[dict, str] | dict:
     """Fetch a page and convert to markdown, with LRU caching (5 min TTL).
 
     Returns (page_dict, markdown) or an error dict.
     """
-    if page_id in _page_cache:
+    if not no_cache and page_id in _page_cache:
         page, markdown, cached_at = _page_cache[page_id]
         if time.monotonic() - cached_at < _CACHE_TTL:
             _page_cache.move_to_end(page_id)
@@ -141,7 +141,8 @@ def _list_xhtml_headings(xhtml: str) -> list[str]:
 
 
 def _replace_section_content(
-    xhtml: str, heading_text: str, new_content: str
+    xhtml: str, heading_text: str, new_content: str,
+    new_heading_text: str | None = None,
 ) -> str | None:
     soup = BeautifulSoup(xhtml, "html.parser")
     heading = _find_xhtml_heading(soup, heading_text)
@@ -152,6 +153,9 @@ def _replace_section_content(
     new_elements = list(BeautifulSoup(new_content, "html.parser").children)
     for el in reversed(new_elements):
         heading.insert_after(el)
+    if new_heading_text is not None:
+        heading.clear()
+        heading.string = new_heading_text
     return str(soup)
 
 
@@ -168,6 +172,77 @@ def _append_to_section_content(
     for el in reversed(new_elements):
         insert_after.insert_after(el)
     return str(soup)
+
+
+def _move_section(
+    xhtml: str,
+    heading_text: str,
+    after: str | None = None,
+    before: str | None = None,
+    new_heading_text: str | None = None,
+    new_level: int | None = None,
+) -> tuple[str | None, str | None]:
+    """Move a section (with subsections) to a new position.
+
+    Returns (new_xhtml, None) on success or (None, error_message) on failure.
+    """
+    soup = BeautifulSoup(xhtml, "html.parser")
+
+    # Find source heading
+    source_heading = _find_xhtml_heading(soup, heading_text)
+    if source_heading is None:
+        return None, f"Source section '{heading_text}' not found"
+
+    source_level = int(source_heading.name[1])
+
+    # Collect source section: heading + content + subsections
+    source_siblings = _collect_section_siblings(source_heading, include_subsections=True)
+    source_elements = [source_heading] + source_siblings
+
+    # Find target heading
+    target_text = after or before
+    if target_text is None:
+        return None, "Specify either 'after' or 'before'"
+    target_heading = _find_xhtml_heading(soup, target_text)
+    if target_heading is None:
+        return None, f"Target section '{target_text}' not found"
+
+    # Target must not be within the source section
+    if target_heading in source_elements:
+        return None, "Target heading is inside the section being moved"
+
+    # Extract source elements from DOM
+    for el in source_elements:
+        el.extract()
+
+    # Adjust heading levels if new_level specified (preserve relative depth)
+    if new_level is not None:
+        delta = new_level - source_level
+        if delta != 0:
+            for el in source_elements:
+                if isinstance(el, Tag) and _HEADING_TAG_RE.match(el.name):
+                    old_level = int(el.name[1])
+                    el.name = f"h{max(1, min(6, old_level + delta))}"
+
+    # Rename heading if specified
+    if new_heading_text is not None:
+        source_heading.clear()
+        source_heading.string = new_heading_text
+
+    # Insert at target position
+    if after:
+        # Place after the target section's last element
+        target_siblings = _collect_section_siblings(target_heading, include_subsections=True)
+        insert_point = target_siblings[-1] if target_siblings else target_heading
+        for el in reversed(source_elements):
+            insert_point.insert_after(el)
+    else:
+        # Place before the target heading (forward order — each insert_before
+        # shifts earlier elements left, so sequential order is correct)
+        for el in source_elements:
+            target_heading.insert_before(el)
+
+    return str(soup), None
 
 
 async def _push_page_update(
@@ -299,15 +374,60 @@ async def get_page(
             )
         ),
     ] = 0,
+    allow_large: Annotated[
+        bool,
+        Field(
+            description=(
+                "If false (default), pages larger than ~10KB return an outline "
+                "instead of full content, with a hint to use get_page_section. "
+                "Set to true to force returning full content regardless of size."
+            )
+        ),
+    ] = False,
+    no_cache: Annotated[
+        bool,
+        Field(
+            description=(
+                "Bypass the page cache and fetch fresh content from Confluence. "
+                "Use this after external edits (edits made outside this MCP server)."
+            )
+        ),
+    ] = False,
 ) -> dict:
     """Get a Confluence page by ID, returning its content as Markdown or raw XHTML."""
     max_length = get_max_length()
+    large_threshold = get_large_page_threshold()
+
+    if no_cache:
+        _page_cache.pop(page_id, None)
 
     if format == "xhtml":
         fetched = await _fetch_page_xhtml(page_id)
         if isinstance(fetched, dict):
             return fetched
         page, xhtml = fetched
+
+        # Size gate: return outline instead of full content for large pages
+        if not allow_large and start_offset == 0 and len(xhtml) > large_threshold:
+            version = page.get("version", {})
+            headings = _list_xhtml_headings(xhtml)
+            size_kb = len(xhtml) / 1024
+            return {
+                "id": str(page.get("id", "")),
+                "title": page.get("title", ""),
+                "format": "xhtml",
+                "version": version.get("number"),
+                "total_length": len(xhtml),
+                "large_page": True,
+                "sections": headings,
+                "url": f"{get_base_url()}/wiki/pages/{page_id}",
+                "hint": (
+                    f"Page is {size_kb:.0f}KB ({len(xhtml)} chars). "
+                    f"Use get_page_section(\"{page_id}\", heading=\"...\", format=\"xhtml\") "
+                    f"to read specific sections, or call get_page with allow_large=true "
+                    f"to retrieve the full content."
+                ),
+            }
 
         content, total_length, has_more = slice_content(xhtml, max_length, start_offset)
         version = page.get("version", {})
@@ -331,10 +451,33 @@ async def get_page(
         return result
 
     # Markdown format (default)
-    fetched = await _fetch_page_markdown(page_id)
+    fetched = await _fetch_page_markdown(page_id, no_cache=no_cache)
     if isinstance(fetched, dict):
         return fetched
     page, full_markdown = fetched
+
+    # Size gate: return outline instead of full content for large pages
+    if not allow_large and start_offset == 0 and len(full_markdown) > large_threshold:
+        sections = extract_outline(full_markdown)
+        version = page.get("version", {})
+        size_kb = len(full_markdown) / 1024
+        return {
+            "id": str(page.get("id", "")),
+            "title": page.get("title", ""),
+            "version": version.get("number"),
+            "total_length": len(full_markdown),
+            "large_page": True,
+            "sections": [
+                {"level": sec.level, "title": sec.title, "line": sec.line_number}
+                for sec in sections
+            ],
+            "url": f"{get_base_url()}/wiki/pages/{page_id}",
+            "hint": (
+                f"Page is {size_kb:.0f}KB ({len(full_markdown)} chars). "
+                f"Use get_page_section(\"{page_id}\", heading=\"...\") to read specific "
+                f"sections, or call get_page with allow_large=true to retrieve the full content."
+            ),
+        }
 
     content, total_length, has_more = slice_content(full_markdown, max_length, start_offset)
 
@@ -386,9 +529,18 @@ async def get_page_outline(
         str,
         Field(description="The Confluence page ID (numeric string)"),
     ],
+    no_cache: Annotated[
+        bool,
+        Field(
+            description=(
+                "Bypass the page cache and fetch fresh content from Confluence. "
+                "Use this after external edits (edits made outside this MCP server)."
+            )
+        ),
+    ] = False,
 ) -> dict:
     """Get the heading structure of a Confluence page as a table of contents."""
-    fetched = await _fetch_page_markdown(page_id)
+    fetched = await _fetch_page_markdown(page_id, no_cache=no_cache)
     if isinstance(fetched, dict):
         return fetched
     page, markdown = fetched
@@ -446,9 +598,21 @@ async def get_page_section(
             )
         ),
     ] = 0,
+    no_cache: Annotated[
+        bool,
+        Field(
+            description=(
+                "Bypass the page cache and fetch fresh content from Confluence. "
+                "Use this after external edits (edits made outside this MCP server)."
+            )
+        ),
+    ] = False,
 ) -> dict:
     """Get the content of a specific section from a Confluence page."""
     max_length = get_max_length()
+
+    if no_cache:
+        _page_cache.pop(page_id, None)
 
     if format == "xhtml":
         fetched = await _fetch_page_xhtml(page_id)
@@ -487,7 +651,7 @@ async def get_page_section(
         return result
 
     # Markdown format (default)
-    fetched = await _fetch_page_markdown(page_id)
+    fetched = await _fetch_page_markdown(page_id, no_cache=no_cache)
     if isinstance(fetched, dict):
         return fetched
     page, markdown = fetched
@@ -780,10 +944,6 @@ async def update_page(
         str,
         Field(description="The Confluence page ID to update"),
     ],
-    title: Annotated[
-        str,
-        Field(description="Page title (required even if unchanged)"),
-    ],
     content: Annotated[
         str,
         Field(
@@ -793,23 +953,29 @@ async def update_page(
             )
         ),
     ],
-    version_number: Annotated[
-        int,
+    title: Annotated[
+        str,
         Field(
-            description=(
-                "New version number (current version + 1). "
-                "Get the current version from the get_page response."
-            )
+            description="New page title. If omitted, the current title is kept."
         ),
-    ],
+    ] = "",
     version_message: Annotated[
         str,
         Field(description="Optional message describing this edit"),
     ] = "",
 ) -> dict:
-    """Update an existing Confluence page using storage format (XHTML)."""
+    """Update an existing Confluence page using storage format (XHTML). Handles versioning automatically."""
+    fetched = await _fetch_page_xhtml(page_id)
+    if isinstance(fetched, dict):
+        return fetched
+    page, _ = fetched
+
+    version = page.get("version", {})
     return await _push_page_update(
-        page_id, title, content, version_number,
+        page_id,
+        title or page.get("title", ""),
+        content,
+        version.get("number", 0) + 1,
         version_message=version_message or None,
     )
 
@@ -833,6 +999,15 @@ async def update_page_section(
             )
         ),
     ],
+    new_heading: Annotated[
+        str,
+        Field(
+            description=(
+                "Optional new heading text to rename the section. "
+                "The heading level (h1-h6) is preserved; only the text changes."
+            )
+        ),
+    ] = "",
     version_message: Annotated[
         str,
         Field(description="Optional message describing this edit"),
@@ -844,7 +1019,10 @@ async def update_page_section(
         return fetched
     page, xhtml = fetched
 
-    new_xhtml = _replace_section_content(xhtml, heading, content)
+    new_xhtml = _replace_section_content(
+        xhtml, heading, content,
+        new_heading_text=new_heading or None,
+    )
     if new_xhtml is None:
         return {
             "error": f"Section '{heading}' not found",
@@ -935,6 +1113,88 @@ async def append_to_section(
             "page_id": page_id,
             "available_sections": _list_xhtml_headings(xhtml),
         }
+
+    version = page.get("version", {})
+    return await _push_page_update(
+        page_id,
+        page.get("title", ""),
+        new_xhtml,
+        version.get("number", 0) + 1,
+        version_message=version_message or None,
+    )
+
+
+async def move_section(
+    page_id: Annotated[
+        str,
+        Field(description="The Confluence page ID to update"),
+    ],
+    heading: Annotated[
+        str,
+        Field(description="Heading text identifying the section to move (case-insensitive)"),
+    ],
+    after: Annotated[
+        str,
+        Field(
+            description=(
+                "Place the section after this heading's section (including its subsections). "
+                "Mutually exclusive with 'before'."
+            )
+        ),
+    ] = "",
+    before: Annotated[
+        str,
+        Field(
+            description=(
+                "Place the section before this heading. "
+                "Mutually exclusive with 'after'."
+            )
+        ),
+    ] = "",
+    new_heading: Annotated[
+        str,
+        Field(description="Optional new heading text to rename the section."),
+    ] = "",
+    new_level: Annotated[
+        int,
+        Field(
+            description=(
+                "Optional new heading level (1-6). Child headings shift by the same "
+                "delta to preserve relative depth (e.g. H2→H1 makes H3 children become H2)."
+            )
+        ),
+    ] = 0,
+    version_message: Annotated[
+        str,
+        Field(description="Optional message describing this edit"),
+    ] = "",
+) -> dict:
+    """Move a section (with all subsections) to a new position on the page. Handles versioning automatically."""
+    has_after = bool(after)
+    has_before = bool(before)
+    if has_after == has_before:
+        return {"error": "Specify exactly one of 'after' or 'before', not both or neither."}
+
+    fetched = await _fetch_page_xhtml(page_id)
+    if isinstance(fetched, dict):
+        return fetched
+    page, xhtml = fetched
+
+    new_xhtml, error = _move_section(
+        xhtml,
+        heading,
+        after=after or None,
+        before=before or None,
+        new_heading_text=new_heading or None,
+        new_level=new_level if new_level >= 1 else None,
+    )
+    if new_xhtml is None:
+        result: dict = {
+            "error": error,
+            "page_id": page_id,
+            "available_sections": _list_xhtml_headings(xhtml),
+        }
+        return result
 
     version = page.get("version", {})
     return await _push_page_update(
