@@ -159,6 +159,19 @@ def _replace_section_content(
     return str(soup)
 
 
+def _delete_section_content(
+    xhtml: str, heading_text: str, include_subsections: bool = True,
+) -> str | None:
+    soup = BeautifulSoup(xhtml, "html.parser")
+    heading = _find_xhtml_heading(soup, heading_text)
+    if heading is None:
+        return None
+    for el in _collect_section_siblings(heading, include_subsections=include_subsections):
+        el.extract()
+    heading.extract()
+    return str(soup)
+
+
 def _append_to_section_content(
     xhtml: str, heading_text: str, new_content: str
 ) -> str | None:
@@ -1195,6 +1208,54 @@ async def move_section(
             "available_sections": _list_xhtml_headings(xhtml),
         }
         return result
+
+    version = page.get("version", {})
+    return await _push_page_update(
+        page_id,
+        page.get("title", ""),
+        new_xhtml,
+        version.get("number", 0) + 1,
+        version_message=version_message or None,
+    )
+
+
+async def delete_section(
+    page_id: Annotated[
+        str,
+        Field(description="The Confluence page ID to update"),
+    ],
+    heading: Annotated[
+        str,
+        Field(description="Heading text identifying the section to delete (case-insensitive)"),
+    ],
+    include_subsections: Annotated[
+        bool,
+        Field(
+            description=(
+                "If true (default), delete the heading and all nested sub-headings. "
+                "If false, delete only the content directly under the heading, "
+                "preserving child sections which get promoted in place."
+            )
+        ),
+    ] = True,
+    version_message: Annotated[
+        str,
+        Field(description="Optional message describing this edit"),
+    ] = "",
+) -> dict:
+    """Delete a section (heading + body) from a Confluence page. Handles versioning automatically."""
+    fetched = await _fetch_page_xhtml(page_id)
+    if isinstance(fetched, dict):
+        return fetched
+    page, xhtml = fetched
+
+    new_xhtml = _delete_section_content(xhtml, heading, include_subsections=include_subsections)
+    if new_xhtml is None:
+        return {
+            "error": f"Section '{heading}' not found",
+            "page_id": page_id,
+            "available_sections": _list_xhtml_headings(xhtml),
+        }
 
     version = page.get("version", {})
     return await _push_page_update(

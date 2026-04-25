@@ -59,6 +59,7 @@ def create_mcp_server() -> FastMCP:
     mcp.add_tool(tools.append_to_page)
     mcp.add_tool(tools.append_to_section)
     mcp.add_tool(tools.move_section)
+    mcp.add_tool(tools.delete_section)
     # Comments, labels, delete
     mcp.add_tool(tools.get_comments)
     mcp.add_tool(tools.add_comment)
