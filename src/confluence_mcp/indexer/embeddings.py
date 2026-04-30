@@ -1,65 +1,20 @@
-"""Embedding helpers — local (sentence-transformers) or remote (HTTP API)."""
+"""Embedding via remote HTTP API only."""
 
 from __future__ import annotations
 
 import logging
 import os
 import time
-from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from confluence_indexer.config import EmbeddingConfig, get_settings
+from confluence_mcp.config import EmbeddingConfig
 
 logger = logging.getLogger(__name__)
 
 
-class Embedding(ABC):
-    """Base class for embedding backends."""
-
-    @abstractmethod
-    def embed_documents(self, texts: list[str], instruction: str) -> list[list[float]]:
-        ...
-
-    @abstractmethod
-    def embed_query(self, text: str, instruction: str) -> list[float]:
-        ...
-
-
-class LocalEmbedding(Embedding):
-    """Embedding via a local sentence-transformers model."""
-
-    def __init__(self, config: EmbeddingConfig) -> None:
-        self._config = config
-        self._model = None
-
-    def _get_model(self):
-        if self._model is None:
-            from sentence_transformers import SentenceTransformer
-
-            logger.info("Loading embedding model %s...", self._config.model_name)
-            self._model = SentenceTransformer(
-                self._config.model_name,
-                trust_remote_code=True,
-            )
-            logger.info("Embedding model loaded.")
-        return self._model
-
-    def embed_documents(self, texts: list[str], instruction: str) -> list[list[float]]:
-        prefixed = [f"search_document: {instruction} {text}" for text in texts]
-        model = self._get_model()
-        vectors = model.encode(prefixed, normalize_embeddings=True)
-        return vectors.tolist()
-
-    def embed_query(self, text: str, instruction: str) -> list[float]:
-        prefixed = [f"search_query: {instruction} {text}"]
-        model = self._get_model()
-        vector = model.encode(prefixed, normalize_embeddings=True)
-        return vector[0].tolist()
-
-
-class APIEmbedding(Embedding):
+class APIEmbedding:
     """Embedding via a remote HTTP API.
 
     Splits large batches and dispatches concurrently via a thread pool.
@@ -145,18 +100,24 @@ class APIEmbedding(Embedding):
         prefixed = [f"search_query: {instruction} {text}"]
         return self._embed(prefixed)[0]
 
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+            self._client = None
 
-_embedder: Embedding | None = None
+
+_embedder: APIEmbedding | None = None
 
 
-def get_embedder() -> Embedding:
+def init_embedder(config: EmbeddingConfig) -> APIEmbedding:
     global _embedder
+    _embedder = APIEmbedding(config)
+    return _embedder
+
+
+def get_embedder() -> APIEmbedding:
     if _embedder is None:
-        cfg = get_settings().embedding
-        if cfg.backend == "remote":
-            _embedder = APIEmbedding(cfg)
-        else:
-            _embedder = LocalEmbedding(cfg)
+        raise RuntimeError("Embedder not initialized — call init_embedder() first")
     return _embedder
 
 

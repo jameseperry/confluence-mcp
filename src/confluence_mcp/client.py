@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import statistics
+from datetime import datetime, timezone
 from typing_extensions import Self
 
 import httpx
@@ -92,6 +94,12 @@ class ConfluenceClient:
         results = data.get("results", [])
         return results[0] if results else None
 
+    async def get_space_by_id(self, space_id: str) -> dict | None:
+        try:
+            return await self._get(f"/wiki/api/v2/spaces/{space_id}")
+        except Exception:
+            return None
+
     async def get_space_pages(
         self, space_id: str, depth: str = "root", limit: int = 25
     ) -> dict:
@@ -168,6 +176,90 @@ class ConfluenceClient:
 
     async def delete_page(self, page_id: str) -> None:
         await self._delete(f"/wiki/api/v2/pages/{page_id}")
+
+    # --- Methods for indexer integration ---
+
+    async def search_cql_paginated(
+        self, cql: str, limit_per_page: int = 50, max_results: int = 5000
+    ) -> list[dict]:
+        """Paginated CQL search up to max_results."""
+        results: list[dict] = []
+        start = 0
+        while len(results) < max_results:
+            data = await self._get(
+                "/wiki/rest/api/search",
+                params={
+                    "cql": cql,
+                    "limit": min(limit_per_page, max_results - len(results)),
+                    "start": start,
+                    "expand": "content.version,content.space",
+                },
+            )
+            batch = data.get("results", [])
+            if not batch:
+                break
+            results.extend(batch)
+            total_size = data.get("totalSize", 0)
+            if len(results) >= total_size:
+                break
+            start += len(batch)
+        return results
+
+    async def get_page_version(self, page_id: str, version: int) -> dict:
+        """Fetch a specific historical version of a page via v1 API."""
+        return await self._get(
+            f"/wiki/rest/api/content/{page_id}",
+            params={
+                "status": "historical",
+                "version": version,
+                "expand": "body.storage",
+            },
+        )
+
+    async def get_page_current_version(self, page_id: str) -> int:
+        data = await self._get(f"/wiki/api/v2/pages/{page_id}")
+        return data.get("version", {}).get("number", 1)
+
+    async def get_version_history(self, page_id: str) -> list[str]:
+        """Fetch version timestamps for a page. Returns ISO datetime strings."""
+        data = await self._get(
+            f"/wiki/rest/api/content/{page_id}/version",
+            params={"limit": 50},
+        )
+        timestamps: list[str] = []
+        for v in data.get("results", []):
+            when = v.get("when", "")
+            if when:
+                timestamps.append(when)
+        return timestamps
+
+    @staticmethod
+    def compute_median_update_interval(version_timestamps: list[str]) -> float | None:
+        """Compute median interval in days between versions.
+
+        Returns None for pages with fewer than 2 versions.
+        """
+        if len(version_timestamps) < 2:
+            return None
+        dts: list[datetime] = []
+        for ts in version_timestamps:
+            try:
+                # Handle Confluence's ISO format (may have timezone)
+                ts_clean = ts.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(ts_clean)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                dts.append(dt)
+            except (ValueError, TypeError):
+                continue
+        if len(dts) < 2:
+            return None
+        dts.sort()
+        intervals = [
+            (dts[i + 1] - dts[i]).total_seconds() / 86400.0
+            for i in range(len(dts) - 1)
+        ]
+        return statistics.median(intervals)
 
     async def close(self) -> None:
         await self._http.aclose()

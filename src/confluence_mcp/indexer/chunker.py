@@ -9,8 +9,6 @@ from dataclasses import dataclass
 
 from confluence_mcp.converter import storage_to_markdown
 
-from confluence_indexer.config import get_settings
-
 logger = logging.getLogger(__name__)
 
 
@@ -27,7 +25,7 @@ def content_hash(text: str) -> str:
 
 
 def chunk_page(
-    storage_html: str, base_url: str = "", max_chars: int | None = None
+    storage_html: str, base_url: str = "", max_chars: int = 2000
 ) -> tuple[str, list[Chunk]]:
     """Convert Confluence XHTML to markdown, then chunk.
 
@@ -38,11 +36,8 @@ def chunk_page(
     return md, chunks
 
 
-def chunk_markdown(text: str, max_chars: int | None = None) -> list[Chunk]:
+def chunk_markdown(text: str, max_chars: int = 2000) -> list[Chunk]:
     """Split markdown text into heading-aware chunks."""
-    if max_chars is None:
-        max_chars = get_settings().max_chunk_chars
-
     lines = text.split("\n")
     raw_chunks: list[Chunk] = []
     heading_stack: list[tuple[int, str]] = []

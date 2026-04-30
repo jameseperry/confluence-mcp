@@ -4,26 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "confluence-mcp"
-version = "0.2.0"
+version = "0.3.0"
 requires-python = ">=3.10"
 dependencies = [
     "fastmcp>=3.2.0",
     "pydantic>=2.0.0",
     "httpx>=0.27.0",
     "markdownify>=0.14.1",
+    "sqlite-vec>=0.1.1",
+    "numpy",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
-]
-indexer = [
-    "fastapi>=0.110.0",
-    "uvicorn>=0.29.0",
-    "sentence-transformers>=3.0.0",
-    "sqlite-vec>=0.1.1",
-    "numpy",
-    "einops",
 ]
 
 [tool.setuptools.packages.find]
@@ -31,4 +25,4 @@ where = ["src"]
 
 [project.scripts]
 confluence-mcp = "confluence_mcp.server:main"
-confluence-indexer = "confluence_indexer.cli:main"
+confluence-indexer = "confluence_mcp.indexer.cli:main"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 import time
 from collections import OrderedDict
@@ -12,9 +14,10 @@ from bs4 import BeautifulSoup, Tag
 from pydantic import Field
 
 from .client import get_client
-from .config import get_base_url, get_large_page_threshold, get_max_length
+from .config import get_base_url, get_embedding_config, get_large_page_threshold, get_max_length
 from .converter import extract_outline, extract_section, slice_content, storage_to_markdown
-from .indexer_client import get_indexer_client
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -76,6 +79,9 @@ async def _fetch_page_markdown(page_id: str, no_cache: bool = False) -> tuple[di
     if len(_page_cache) > _CACHE_MAX:
         _page_cache.popitem(last=False)
 
+    # Trigger on-demand indexing (non-blocking)
+    _schedule_index(page_id, storage_body, page)
+
     return page, markdown
 
 
@@ -92,6 +98,67 @@ async def _fetch_page_xhtml(page_id: str) -> tuple[dict, str] | dict:
         return {"error": f"Failed to get page: {exc.response.status_code}", "page_id": page_id}
     storage_body = page.get("body", {}).get("storage", {}).get("value", "")
     return page, storage_body
+
+
+# ---------------------------------------------------------------------------
+# On-demand indexing
+# ---------------------------------------------------------------------------
+
+_index_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_index(page_id: str, storage_html: str, page_data: dict) -> None:
+    """Schedule on-demand indexing as a background task (non-blocking)."""
+    if get_embedding_config() is None:
+        return
+    task = asyncio.create_task(_maybe_index_page(page_id, storage_html, page_data))
+    _index_tasks.add(task)
+    task.add_done_callback(_index_tasks.discard)
+
+
+_space_key_cache: dict[str, str] = {}
+
+
+async def _resolve_space_key(client, space_id: str) -> str:
+    """Resolve a numeric space ID to a space key, with caching."""
+    if space_id in _space_key_cache:
+        return _space_key_cache[space_id]
+    space = await client.get_space_by_id(space_id)
+    if space:
+        key = space.get("key", space_id)
+        _space_key_cache[space_id] = key
+        return key
+    return space_id
+
+
+async def _maybe_index_page(page_id: str, storage_html: str, page_data: dict) -> None:
+    """Opportunistically index a fetched page."""
+    try:
+        from .config import get_max_chunk_chars
+        from .indexer.db import get_conn
+        from .indexer.pipeline import index_page_from_fetch
+
+        conn = get_conn()
+        client = get_client()
+
+        title = page_data.get("title", "")
+        # v2 API returns numeric spaceId — resolve to space key
+        space_id = page_data.get("spaceId", "")
+        space_key = await _resolve_space_key(client, space_id) if space_id else ""
+        version = page_data.get("version", {}).get("number", 1)
+
+        base_url = ""
+        try:
+            base_url = get_base_url()
+        except RuntimeError:
+            pass
+
+        await index_page_from_fetch(
+            conn, client, page_id, title, space_key, version,
+            storage_html, base_url, get_max_chunk_chars(),
+        )
+    except Exception:
+        logger.debug("On-demand indexing failed for page %s", page_id, exc_info=True)
 
 
 # -- XHTML section helpers --------------------------------------------------
@@ -1385,7 +1452,7 @@ async def delete_page(
 
 
 # ---------------------------------------------------------------------------
-# Semantic search (via indexer service)
+# Semantic search (integrated indexer)
 # ---------------------------------------------------------------------------
 
 
@@ -1394,15 +1461,11 @@ async def semantic_search(
         str,
         Field(description="Natural language search query"),
     ],
-    scope: Annotated[
-        str,
-        Field(description="Restrict search to a specific index scope. Omit to search all."),
-    ] = "",
     perspective: Annotated[
         str,
         Field(
             description=(
-                "Search perspective (e.g. 'general', 'technical', 'procedural'). "
+                "Search perspective (e.g. 'technical', 'project'). "
                 "Omit for best results across all perspectives."
             )
         ),
@@ -1415,37 +1478,236 @@ async def semantic_search(
     """Semantic search across indexed Confluence pages using vector embeddings.
 
     Returns ranked results with relevance scores, page titles, headings, and content snippets.
-    Requires a running indexer service (set CONFLUENCE_INDEXER_URL).
+    Requires a configured embedding service (set EMBEDDING_API_URL).
     """
-    client = get_indexer_client()
-    if client is None:
+    if get_embedding_config() is None:
         return {
-            "error": "Semantic search not available — CONFLUENCE_INDEXER_URL not configured",
+            "error": "Semantic search not available — set EMBEDDING_API_URL to enable",
         }
 
     limit = max(1, min(limit, 50))
     try:
-        data = await client.search(
+        from .indexer.db import get_conn
+        from .indexer.search import semantic_search as _search
+
+        conn = get_conn()
+        results = _search(
+            conn,
             query,
-            scope=scope or None,
             perspective=perspective or None,
             limit=limit,
         )
     except Exception as exc:
         return {"error": f"Semantic search failed: {exc}"}
 
-    results = []
     base_url = get_base_url()
-    for item in data.get("results", []):
-        results.append({
-            "score": round(item.get("score", 0), 4),
-            "page_id": item.get("page_id", ""),
-            "title": item.get("page_title", ""),
-            "space_key": item.get("space_key", ""),
-            "heading": item.get("heading", ""),
-            "snippet": item.get("snippet", ""),
-            "scope": item.get("scope", ""),
-            "url": f"{base_url}/wiki/pages/{item.get('page_id', '')}",
-        })
+    for r in results:
+        r["url"] = f"{base_url}/wiki/pages/{r.get('page_id', '')}"
 
     return {"query": query, "results": results}
+
+
+# ---------------------------------------------------------------------------
+# Perspective management
+# ---------------------------------------------------------------------------
+
+
+def _require_indexer() -> dict | None:
+    """Returns an error dict if the indexer is not configured, else None."""
+    if get_embedding_config() is None:
+        return {"error": "Indexer not configured — set EMBEDDING_API_URL to enable"}
+    return None
+
+
+async def list_perspectives() -> dict:
+    """Returns current perspectives with names and instructions."""
+    if err := _require_indexer():
+        return err
+    try:
+        from .indexer.db import get_conn, get_perspectives as _get_perspectives
+
+        conn = get_conn()
+        perspectives = _get_perspectives(conn)
+        return {"perspectives": perspectives}
+    except Exception as exc:
+        return {"error": f"Failed to list perspectives: {exc}"}
+
+
+async def add_perspective(
+    name: Annotated[
+        str,
+        Field(description="Name for the new perspective"),
+    ],
+    instruction: Annotated[
+        str,
+        Field(description="Instruction describing what this perspective focuses on"),
+    ],
+) -> dict:
+    """Adds a new embedding perspective. Existing chunks are lazily re-embedded on next page access."""
+    if err := _require_indexer():
+        return err
+    embed_config = get_embedding_config()
+    try:
+        from .indexer.db import add_perspective as _add_perspective, get_conn
+
+        conn = get_conn()
+        result = _add_perspective(conn, name, instruction, embed_config.dimensions)
+        return {"added": True, **result}
+    except ValueError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        return {"error": f"Failed to add perspective: {exc}"}
+
+
+async def remove_perspective(
+    name: Annotated[
+        str,
+        Field(description="Name of the perspective to remove"),
+    ],
+) -> dict:
+    """Removes a perspective and drops its vector table."""
+    if err := _require_indexer():
+        return err
+    try:
+        from .indexer.db import get_conn, remove_perspective as _remove_perspective
+
+        conn = get_conn()
+        removed = _remove_perspective(conn, name)
+        if removed:
+            return {"removed": True, "name": name}
+        return {"error": f"Perspective '{name}' not found"}
+    except Exception as exc:
+        return {"error": f"Failed to remove perspective: {exc}"}
+
+
+# ---------------------------------------------------------------------------
+# Index status and scope management
+# ---------------------------------------------------------------------------
+
+
+async def index_status() -> dict:
+    """Show the current state of the documentation index.
+
+    Reports per-KB indexed files, chunks, stale counts, and perspectives.
+    """
+    if err := _require_indexer():
+        return err
+    try:
+        from .indexer.db import get_conn
+        from .indexer.search import get_index_status as _get_status
+
+        conn = get_conn()
+        return _get_status(conn)
+    except Exception as exc:
+        return {"error": f"Failed to get index status: {exc}"}
+
+
+async def list_index_scopes() -> dict:
+    """Returns configured index scopes (spaces or page trees for bulk indexing)."""
+    if err := _require_indexer():
+        return err
+    try:
+        from .indexer.db import get_conn, list_index_scopes as _list_scopes
+
+        conn = get_conn()
+        scopes = _list_scopes(conn)
+        return {"scopes": scopes}
+    except Exception as exc:
+        return {"error": f"Failed to list scopes: {exc}"}
+
+
+async def add_index_scope(
+    label: Annotated[
+        str,
+        Field(description="Unique label for this scope (e.g. the space key)"),
+    ],
+    scope_type: Annotated[
+        str,
+        Field(description="Type: 'space' for a whole Confluence space, 'page_tree' for a page and its descendants"),
+    ] = "space",
+    scope_id: Annotated[
+        str,
+        Field(description="The space key (for space) or root page ID (for page_tree). Defaults to label if omitted."),
+    ] = "",
+) -> dict:
+    """Add an index scope for bulk indexing. Use index_now to trigger indexing."""
+    if err := _require_indexer():
+        return err
+    if not scope_id:
+        scope_id = label
+    try:
+        from .indexer.db import add_index_scope as _add_scope, get_conn
+
+        conn = get_conn()
+        result = _add_scope(conn, label, scope_type, scope_id)
+        return {"added": True, **result}
+    except ValueError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        return {"error": f"Failed to add scope: {exc}"}
+
+
+async def remove_index_scope(
+    label: Annotated[
+        str,
+        Field(description="Label of the scope to remove"),
+    ],
+) -> dict:
+    """Remove an index scope."""
+    if err := _require_indexer():
+        return err
+    try:
+        from .indexer.db import get_conn, remove_index_scope as _remove_scope
+
+        conn = get_conn()
+        removed = _remove_scope(conn, label)
+        if removed:
+            return {"removed": True, "label": label}
+        return {"error": f"Scope '{label}' not found"}
+    except Exception as exc:
+        return {"error": f"Failed to remove scope: {exc}"}
+
+
+async def index_now(
+    label: Annotated[
+        str,
+        Field(description="Label of the scope to index. Must be added via add_index_scope first."),
+    ] = "",
+    force: Annotated[
+        bool,
+        Field(description="Force full re-index even if pages haven't changed"),
+    ] = False,
+) -> dict:
+    """Trigger bulk indexing of a scope. Runs as a background task."""
+    if err := _require_indexer():
+        return err
+    try:
+        from .config import get_max_chunk_chars
+        from .indexer.db import get_conn, list_index_scopes as _list_scopes
+        from .indexer.pipeline import index_scope as _index_scope
+
+        conn = get_conn()
+        scopes = _list_scopes(conn)
+
+        if label:
+            scopes = [s for s in scopes if s["label"] == label]
+            if not scopes:
+                return {"error": f"Scope '{label}' not found. Add it with add_index_scope first."}
+        if not scopes:
+            return {"error": "No scopes configured. Add one with add_index_scope first."}
+
+        client = get_client()
+        results = {}
+        for scope in scopes:
+            stats = await _index_scope(
+                client, conn,
+                scope_type=scope["scope_type"],
+                scope_id=scope["scope_id"],
+                label=scope["label"],
+                max_chunk_chars=get_max_chunk_chars(),
+                force=force,
+            )
+            results[scope["label"]] = stats
+        return {"indexed": results}
+    except Exception as exc:
+        return {"error": f"Indexing failed: {exc}"}
