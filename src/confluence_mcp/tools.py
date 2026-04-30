@@ -105,6 +105,7 @@ async def _fetch_page_xhtml(page_id: str) -> tuple[dict, str] | dict:
 # ---------------------------------------------------------------------------
 
 _index_tasks: set[asyncio.Task] = set()
+_bulk_index_tasks: dict[str, asyncio.Task] = {}
 
 
 def _schedule_index(page_id: str, storage_html: str, page_data: dict) -> None:
@@ -1597,7 +1598,9 @@ async def index_status() -> dict:
         from .indexer.search import get_index_status as _get_status
 
         conn = get_conn()
-        return _get_status(conn)
+        result = _get_status(conn)
+        result["indexing_in_progress"] = list(_bulk_index_tasks.keys())
+        return result
     except Exception as exc:
         return {"error": f"Failed to get index status: {exc}"}
 
@@ -1684,7 +1687,6 @@ async def index_now(
     try:
         from .config import get_max_chunk_chars
         from .indexer.db import get_conn, list_index_scopes as _list_scopes
-        from .indexer.pipeline import index_scope as _index_scope
 
         conn = get_conn()
         scopes = _list_scopes(conn)
@@ -1696,18 +1698,43 @@ async def index_now(
         if not scopes:
             return {"error": "No scopes configured. Add one with add_index_scope first."}
 
-        client = get_client()
-        results = {}
+        started: list[str] = []
+        skipped: list[str] = []
         for scope in scopes:
-            stats = await _index_scope(
-                client, conn,
-                scope_type=scope["scope_type"],
-                scope_id=scope["scope_id"],
-                label=scope["label"],
-                max_chunk_chars=get_max_chunk_chars(),
-                force=force,
+            scope_label = scope["label"]
+            if scope_label in _bulk_index_tasks:
+                skipped.append(scope_label)
+                continue
+            task = asyncio.create_task(
+                _run_bulk_index(conn, scope, get_max_chunk_chars(), force)
             )
-            results[scope["label"]] = stats
-        return {"indexed": results}
+            _bulk_index_tasks[scope_label] = task
+            task.add_done_callback(lambda t, lbl=scope_label: _bulk_index_tasks.pop(lbl, None))
+            started.append(scope_label)
+
+        result: dict = {"status": "started", "scopes": started}
+        if skipped:
+            result["already_running"] = skipped
+        return result
     except Exception as exc:
         return {"error": f"Indexing failed: {exc}"}
+
+
+async def _run_bulk_index(
+    conn, scope: dict, max_chunk_chars: int, force: bool
+) -> None:
+    """Background task for bulk scope indexing."""
+    from .indexer.pipeline import index_scope as _index_scope
+
+    try:
+        client = get_client()
+        await _index_scope(
+            client, conn,
+            scope_type=scope["scope_type"],
+            scope_id=scope["scope_id"],
+            label=scope["label"],
+            max_chunk_chars=max_chunk_chars,
+            force=force,
+        )
+    except Exception:
+        logger.exception("Bulk indexing failed for scope '%s'", scope["label"])
