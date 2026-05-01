@@ -187,6 +187,7 @@ confluence-indexer status
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `EMBEDDING_API_HEADERS` | (none) | Headers to send with embedding API requests. Comma-separated `Key:Value` pairs, e.g. `Ocp-Apim-Subscription-Key:your-key` |
 | `EMBEDDING_API_DIMENSIONS` | 768 | Embedding vector dimensions |
 | `EMBEDDING_API_BATCH_SIZE` | 128 | Max texts per embedding API request |
 | `EMBEDDING_API_MAX_CONCURRENT` | 4 | Max concurrent embedding requests |
